@@ -1,0 +1,1335 @@
+"""StyleGAN2 for eyeglass frame generation (256x512), image-only (no mask branch)."""
+
+import argparse
+import glob
+import json
+import math
+import os
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from PIL import Image
+from torch.nn.utils import spectral_norm
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torchmetrics.image.kid import KernelInceptionDistance
+from torchvision import models, transforms
+from torchvision.utils import save_image
+from tqdm import tqdm
+
+
+class Config:
+    """Central hyperparameter store."""
+
+    img_height = 256
+    img_width = 512
+
+    latent_dim = 512
+    w_dim = 512
+    mapping_depth = 8
+
+    batch_size = 16
+    lr_g = 0.0002
+    lr_d = 0.00005
+    beta1 = 0.0
+    beta2 = 0.99
+
+    r1_gamma = 5.0
+    r1_interval = 16
+
+    fm_weight = 2.0
+
+    ppl_weight = 4.0
+    ppl_interval = 16
+    ppl_decay = 0.99
+    ppl_batch_size = 16
+
+    perceptual_weight = 0.75
+
+    style_mixing_prob = 0.9
+
+    ema_decay = 0.999
+    save_every = 10
+
+    snapshot_every = 0
+
+    kid_start = 100
+    kid_interval = 15
+    kid_n_real = 1000
+    kid_n_fake = 1000
+
+    d_width_mult = 1.0
+    g_width_mult = 1.0
+    g_mirror_coupling = False
+    g_mirror_axis = False
+    xflip = True
+    d_edge_channel = False
+    d_edge_warmup = 150
+
+    ada_target = 0.6
+    ada_interval = 4
+    ada_step = 0.002
+    ada_max_p = 0.95
+    ada_color_max_p = 0.0
+
+    sample_weights = ''
+
+    num_workers = 2
+    seed = 42
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_cuda = torch.cuda.is_available()
+
+
+cfg = Config()
+
+DATASET_PATH = Path('data/source/images')
+OUTPUT_ROOT = Path('results/run')
+CHECKPOINT_DIR = OUTPUT_ROOT / 'checkpoints'
+SAMPLES_DIR = OUTPUT_ROOT / 'samples'
+METRICS_DIR = OUTPUT_ROOT / 'metrics'
+GENERATED_DIR = OUTPUT_ROOT / 'generated'
+
+
+def setup_directories():
+    for d in [CHECKPOINT_DIR, SAMPLES_DIR, METRICS_DIR, GENERATED_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def code_version():
+    """Git commit of the training code, plus whether the tree was dirty."""
+    info = {'torch': torch.__version__,
+            'cuda': torch.version.cuda,
+            'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available()
+                   else None}
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        import subprocess
+        run = lambda a: subprocess.run(
+            a, cwd=str(repo), capture_output=True, text=True, timeout=10)
+        head = run(['git', 'rev-parse', 'HEAD'])
+        if head.returncode == 0:
+            info['git_commit'] = head.stdout.strip()
+            info['git_dirty'] = bool(
+                run(['git', 'status', '--porcelain']).stdout.strip())
+    except Exception:
+        pass
+    return info
+
+
+def save_run_config(args):
+    """Snapshot the effective configuration of this run for reproducibility."""
+    merged = {**vars(Config), **vars(cfg)}
+    payload = {k: (str(v) if isinstance(v, torch.device) else v)
+               for k, v in merged.items()
+               if not k.startswith('_')
+               and isinstance(v, (int, float, str, bool, torch.device))}
+    payload['cli_args'] = vars(args)
+    payload['env'] = code_version()
+    payload['launched_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    name = 'generation_config.json' if getattr(args, 'generate_only', None) \
+        else 'run_config.json'
+    with open(OUTPUT_ROOT / name, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+    hist_path = OUTPUT_ROOT / 'run_config_history.json'
+    history = []
+    if hist_path.exists():
+        try:
+            with open(hist_path) as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+    history.append(payload)
+    with open(hist_path, 'w') as f:
+        json.dump(history, f, indent=2)
+
+
+class EyeglassesDataset(Dataset):
+    """Image-only dataset of frontal eyeglass frame photos."""
+
+    def __init__(self, images_dir, transform):
+        self.transform = transform
+        self.image_paths = []
+        for ext in ['*.png', '*.jpg', '*.jpeg']:
+            self.image_paths.extend(
+                glob.glob(os.path.join(images_dir, '**', ext), recursive=True))
+        self.image_paths.sort()
+        if not self.image_paths:
+            raise FileNotFoundError(f'No images found under {images_dir}')
+        print(f'Found {len(self.image_paths)} images')
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.image_paths[idx]).convert('RGB')
+
+        w, h = image.size
+        target_ratio = cfg.img_width / cfg.img_height
+        if w / h > target_ratio:
+            new_w = int(h * target_ratio)
+            left = (w - new_w) // 2
+            image = image.crop((left, 0, left + new_w, h))
+        else:
+            new_h = int(w / target_ratio)
+            top = (h - new_h) // 2
+            image = image.crop((0, top, w, top + new_h))
+
+        return self.transform(image)
+
+
+class PixelNorm(nn.Module):
+    def forward(self, x):
+        return x / torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + 1e-8)
+
+
+class EqualLinear(nn.Module):
+    """Linear layer with equalized learning rate (StyleGAN)."""
+
+    def __init__(self, in_dim, out_dim, lr_mul=1.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim) / lr_mul)
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+        self.scale = lr_mul / math.sqrt(in_dim)
+        self.lr_mul = lr_mul
+
+    def forward(self, x):
+        return F.linear(x, self.weight * self.scale, self.bias * self.lr_mul)
+
+
+class ScaledLeakyReLU(nn.Module):
+    """LeakyReLU(0.2) with the sqrt(2) gain that keeps variance constant."""
+
+    def forward(self, x):
+        return F.leaky_relu(x, 0.2) * math.sqrt(2.0)
+
+
+class Blur(nn.Module):
+    """Fixed binomial low-pass filter ([1,2,1] x [1,2,1]), depthwise."""
+
+    def forward(self, x):
+        x = F.pad(x, (1, 1, 1, 1))
+        x = (x[..., :-2] + 2.0 * x[..., 1:-1] + x[..., 2:]) * 0.25
+        x = (x[..., :-2, :] + 2.0 * x[..., 1:-1, :] + x[..., 2:, :]) * 0.25
+        return x
+
+
+class MappingNetwork(nn.Module):
+    """Noise z -> style code w via a pixel-normalised, equalized-lr MLP."""
+
+    def __init__(self, z_dim, w_dim, depth=8):
+        super().__init__()
+        layers = [PixelNorm()]
+        for _ in range(depth):
+            layers.append(EqualLinear(z_dim, w_dim, lr_mul=0.01))
+            layers.append(ScaledLeakyReLU())
+            z_dim = w_dim
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class NoiseInjection(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x):
+        noise = torch.randn(x.size(0), 1, x.size(2), x.size(3), device=x.device)
+        return x + self.weight * noise
+
+
+class StyleMod(nn.Module):
+    """Per-channel affine (scale, shift) parameters from a style vector w."""
+
+    def __init__(self, in_channels, w_dim):
+        super().__init__()
+        self.fc = nn.Linear(w_dim, in_channels * 2)
+        self.fc.bias.data[:in_channels] = 1.0
+        self.fc.bias.data[in_channels:] = 0.0
+
+    def forward(self, w):
+        style = self.fc(w).unsqueeze(2).unsqueeze(3)
+        return style.chunk(2, dim=1)
+
+
+class ModulatedConv2d(nn.Module):
+    """Weight-modulated convolution, the core StyleGAN2 operation."""
+
+    def __init__(self, in_channels, out_channels, kernel_size, w_dim, demodulate=True):
+        super().__init__()
+        self.demodulate = demodulate
+        self.eps = 1e-8
+        self.pad = kernel_size // 2
+        self.weight = nn.Parameter(
+            torch.randn(1, out_channels, in_channels, kernel_size, kernel_size))
+        nn.init.kaiming_normal_(self.weight[0], a=0.2, mode='fan_in',
+                                nonlinearity='leaky_relu')
+        self.style = StyleMod(in_channels, w_dim)
+
+    def forward(self, x, w):
+        B = x.size(0)
+        scale, _ = self.style(w)
+        weight = self.weight * scale.unsqueeze(1)
+        if self.demodulate:
+            sigma = torch.sqrt((weight ** 2).sum([2, 3, 4], keepdim=True) + self.eps)
+            weight = weight / sigma
+        weight = weight.reshape(B * weight.size(1), weight.size(2),
+                                weight.size(3), weight.size(4))
+        x = x.reshape(1, B * x.size(1), x.size(2), x.size(3))
+        out = F.conv2d(x, weight, padding=self.pad, groups=B)
+        return out.reshape(B, -1, out.size(2), out.size(3))
+
+
+class StyledConvBlock(nn.Module):
+    """Modulated conv -> noise injection -> bias + activation."""
+
+    def __init__(self, in_channels, out_channels, w_dim):
+        super().__init__()
+        self.conv = ModulatedConv2d(in_channels, out_channels, 3, w_dim)
+        self.noise = NoiseInjection(out_channels)
+        self.bias = nn.Parameter(torch.zeros(1, out_channels, 1, 1))
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, x, w):
+        x = self.conv(x, w)
+        x = self.noise(x)
+        return self.act(x + self.bias)
+
+
+class SelfAttention(nn.Module):
+    """Non-local self-attention; applied at low resolution only (O(H^2 W^2))."""
+
+    def __init__(self, channels):
+        super().__init__()
+        mid = max(channels // 8, 1)
+        self.query = spectral_norm(nn.Conv2d(channels, mid, 1))
+        self.key = spectral_norm(nn.Conv2d(channels, mid, 1))
+        self.value = spectral_norm(nn.Conv2d(channels, channels, 1))
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        q = self.query(x).view(B, -1, H * W).permute(0, 2, 1)
+        k = self.key(x).view(B, -1, H * W)
+        v = self.value(x).view(B, -1, H * W)
+        attn = torch.bmm(q, k) / math.sqrt(q.size(-1))
+        attn = F.softmax(attn, dim=-1)
+        out = torch.bmm(v, attn.permute(0, 2, 1)).view(B, C, H, W)
+        return x + self.gamma * out
+
+
+class MirrorCoupling(nn.Module):
+    """Let every position see its horizontal mirror counterpart."""
+
+    MAX_AXIS = 0.05
+
+    def __init__(self, channels, w_dim=None):
+        super().__init__()
+        self.proj = nn.Conv2d(2 * channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        if w_dim is None:
+            self.axis = None
+        else:
+            self.axis = nn.Linear(w_dim, 1)
+            nn.init.zeros_(self.axis.weight)
+            nn.init.zeros_(self.axis.bias)
+
+    @staticmethod
+    def _shift_h(x, d):
+        """Translate x horizontally by d px per sample, bilinear, zero-padded."""
+        n, c, h, w = x.shape
+        pad = int(math.ceil(MirrorCoupling.MAX_AXIS * w)) + 1
+        xp = F.pad(x, (pad, pad))
+        wp = w + 2 * pad
+        base = torch.arange(w, device=x.device, dtype=torch.float32) + pad
+        src = (base.view(1, w) - d.view(n, 1).float()).clamp(0, wp - 1)
+        lo = src.floor()
+        frac = (src - lo).to(x.dtype).view(n, 1, 1, w)
+        i0 = lo.long().view(n, 1, 1, w).expand(n, c, h, w)
+        i1 = (lo + 1).clamp(max=wp - 1).long().view(n, 1, 1, w).expand(n, c, h, w)
+        g0 = torch.gather(xp, 3, i0)
+        g1 = torch.gather(xp, 3, i1)
+        return g0 + (g1 - g0) * frac
+
+    def forward(self, x, w):
+        flipped = torch.flip(x, dims=[3])
+        if self.axis is not None:
+            a = torch.tanh(self.axis(w)) * self.MAX_AXIS
+            flipped = self._shift_h(flipped, a[:, 0] * x.size(3))
+        pair = torch.cat([x, flipped], dim=1)
+        return x + self.gamma * self.proj(pair)
+
+
+class Generator(nn.Module):
+    """StyleGAN2 synthesis network for 256x512 eyeglass frames (image only)."""
+
+    CHANNELS = [512, 256, 256, 128, 64, 32, 16]
+
+    def __init__(self, z_dim=512, w_dim=512, mapping_depth=8, g_width_mult=1.0,
+                 mirror_coupling=False, mirror_axis=False):
+        super().__init__()
+        self.w_dim = w_dim
+        self.num_stages = len(self.CHANNELS) - 1
+        self.mapping = MappingNetwork(z_dim, w_dim, depth=mapping_depth)
+        ch = [min(512, max(16, int(round(c * g_width_mult))))
+              for c in self.CHANNELS]
+        self.const = nn.Parameter(torch.randn(1, ch[0], 4, 8))
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear',
+                                    align_corners=False)
+        self.blocks = nn.ModuleList()
+        self.to_rgb = nn.ModuleList()
+        self.attn_idx = 2
+        self.attention = SelfAttention(ch[self.attn_idx + 1])
+
+        self.mirror_idx = (2, 3) if (mirror_coupling or mirror_axis) else ()
+        axis_dim = w_dim if mirror_axis else None
+        self.mirror = nn.ModuleDict(
+            {str(i): MirrorCoupling(ch[i + 1], axis_dim)
+             for i in self.mirror_idx})
+
+        for i in range(self.num_stages):
+            self.blocks.append(nn.ModuleList([
+                StyledConvBlock(ch[i], ch[i + 1], w_dim),
+                StyledConvBlock(ch[i + 1], ch[i + 1], w_dim),
+            ]))
+            self.to_rgb.append(ModulatedConv2d(ch[i + 1], 3, 1, w_dim,
+                                               demodulate=False))
+
+    def get_w(self, z):
+        return self.mapping(z)
+
+    def synthesis(self, w):
+        """w: (B, w_dim) shared across stages, or (B, num_stages, w_dim)."""
+        if w.dim() == 2:
+            w = w.unsqueeze(1).expand(-1, self.num_stages, -1)
+
+        batch_size = w.size(0)
+        x = self.const.repeat(batch_size, 1, 1, 1)
+        rgb = None
+
+        for i, (block, rgb_layer) in enumerate(zip(self.blocks, self.to_rgb)):
+            w_i = w[:, i]
+            x = self.upsample(x)
+            x = block[0](x, w_i)
+            x = block[1](x, w_i)
+            if i == self.attn_idx:
+                x = self.attention(x)
+            if str(i) in self.mirror:
+                x = self.mirror[str(i)](x, w_i)
+            rgb_out = rgb_layer(x, w_i)
+            rgb = rgb_out if rgb is None else self.upsample(rgb) + rgb_out
+
+        return rgb
+
+    def forward(self, z, style_mixing_prob=0.0):
+        w = self.get_w(z)
+        w = w.unsqueeze(1).expand(-1, self.num_stages, -1).contiguous()
+
+        if style_mixing_prob > 0 and random.random() < style_mixing_prob:
+            z2 = torch.randn_like(z)
+            w2 = self.get_w(z2)
+            cut = random.randint(1, self.num_stages - 1)
+            w[:, cut:] = w2.unsqueeze(1).expand(-1, self.num_stages - cut, -1)
+
+        return self.synthesis(w)
+
+
+class MinibatchSTD(nn.Module):
+    """Appends a group-wise std channel (official StyleGAN2 form)."""
+
+    def __init__(self, group_size=4):
+        super().__init__()
+        self.group_size = group_size
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        g = self.group_size
+        while B % g != 0:
+            g -= 1
+        y = x.view(g, B // g, C, H, W).float()
+        std = torch.sqrt(y.var(dim=0, unbiased=False) + 1e-8)
+        stat = std.mean(dim=[1, 2, 3], keepdim=True)
+        stat = stat.unsqueeze(0).expand(g, -1, -1, -1, -1).reshape(B, 1, 1, 1)
+        return torch.cat([x, stat.to(x.dtype).expand(B, 1, H, W)], dim=1)
+
+
+class DiscBlock(nn.Module):
+    """Residual downsampling block: two convs + 1x1 skip, then avg-pool."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.blur = Blur()
+        self.down = nn.AvgPool2d(2)
+        self.skip = nn.Conv2d(in_channels, out_channels, 1)
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        y = self.act(self.conv1(x))
+        y = self.act(self.conv2(y))
+        return self.down(self.blur(y)) + self.down(self.blur(self.skip(x)))
+
+
+class Discriminator(nn.Module):
+    """Discriminator on 3-channel RGB input (mask channel removed)."""
+
+    def __init__(self, d_width_mult=1.0, edge_channel=False):
+        super().__init__()
+        base = [16, 32, 64, 128, 256, 256]
+        ch = [max(8, int(round(c * d_width_mult))) for c in base]
+
+        self.edge_channel = edge_channel
+        self.edge_scale = 1.0
+        if edge_channel:
+            sx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]])
+            self.register_buffer('sobel_x', sx.view(1, 1, 3, 3))
+            self.register_buffer('sobel_y', sx.t().contiguous().view(1, 1, 3, 3))
+        self.from_rgb = nn.Conv2d(4 if edge_channel else 3, ch[0], 1)
+        self.act = nn.LeakyReLU(0.2)
+        self.blocks = nn.Sequential(*[
+            DiscBlock(ch[i], ch[i + 1]) for i in range(len(ch) - 1)
+        ])
+        self.attn = SelfAttention(ch[3])
+        self.mbstd = MinibatchSTD()
+        self.final = nn.Conv2d(ch[-1] + 1, ch[-1], 3, padding=1)
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4),
+            nn.Flatten(),
+            nn.Linear(ch[-1] * 16, 1),
+        )
+
+    def forward(self, img, return_features=False):
+        if self.edge_channel:
+            gray = img.mean(dim=1, keepdim=True)
+            gx = F.conv2d(gray, self.sobel_x.to(gray.dtype), padding=1)
+            gy = F.conv2d(gray, self.sobel_y.to(gray.dtype), padding=1)
+            edge = (torch.sqrt(gx * gx + gy * gy + 1e-8) * 0.25 - 1.0)
+            s = self.edge_scale
+            if self.training and s < 1.0:
+                edge = edge * s + torch.randn_like(edge) * (1.0 - s)
+            img = torch.cat([img, edge], dim=1)
+        x = self.act(self.from_rgb(img))
+        features = []
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            if i == 2:
+                x = self.attn(x)
+            if return_features:
+                features.append(x)
+        x = self.mbstd(x)
+        x = self.act(self.final(x))
+        logit = self.head(x).squeeze(1)
+        if return_features:
+            return logit, features
+        return logit
+
+
+def d_logistic(real_pred, fake_pred):
+    return F.softplus(-real_pred).mean() + F.softplus(fake_pred).mean()
+
+
+def g_nonsat(fake_pred):
+    return F.softplus(-fake_pred).mean()
+
+
+def r1_penalty(real_pred, real_img):
+    grad = torch.autograd.grad(outputs=real_pred.sum(), inputs=real_img,
+                               create_graph=True)[0]
+    return (grad.view(grad.size(0), -1).norm(2, dim=1) ** 2).mean()
+
+
+class VGGPerceptualLoss(nn.Module):
+    """Frozen VGG16 features at relu1_2, relu2_2, relu3_3."""
+
+    def __init__(self):
+        super().__init__()
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+        self.slice1 = nn.Sequential(*list(vgg)[:4])
+        self.slice2 = nn.Sequential(*list(vgg)[4:9])
+        self.slice3 = nn.Sequential(*list(vgg)[9:18])
+        for param in self.parameters():
+            param.requires_grad = False
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _normalize(self, x):
+        return ((x + 1) / 2.0 - self.mean) / self.std
+
+    def forward(self, pred, target):
+        p = self._normalize(pred)
+        t = self._normalize(target)
+        p_feats, t_feats = [], []
+        for layer in [self.slice1, self.slice2, self.slice3]:
+            p = layer(p)
+            with torch.no_grad():
+                t = layer(t)
+            p_feats.append(p)
+            t_feats.append(t)
+
+        with torch.no_grad():
+            pv = p_feats[-1].mean([2, 3]).float()
+            tv = t_feats[-1].mean([2, 3]).float()
+            match = torch.cdist(pv, tv).argmin(dim=1)
+
+        loss = 0.0
+        for pf, tf, w in zip(p_feats, t_feats, [1.0, 1.0, 0.5]):
+            loss += w * F.l1_loss(pf, tf[match])
+        return loss
+
+
+class ADAugment:
+    """Adaptive discriminator augmentation (Karras et al., 2020)."""
+
+    def __init__(self, target=0.6, step=0.002, max_p=0.85, interval=4,
+                 color_max_p=None):
+        self.target = target
+        self.step = step
+        self.max_p = max_p
+        self.interval = interval
+        self.color_max_p = max_p if color_max_p is None else color_max_p
+        self.p = 0.0
+        self._signs = []
+
+    def update(self, real_pred):
+        self._signs.append((real_pred > 0).float().mean().item())
+        if len(self._signs) >= self.interval:
+            rt = sum(self._signs) / len(self._signs)
+            self._signs.clear()
+            if rt > self.target:
+                self.p = min(self.p + self.step, self.max_p)
+            else:
+                self.p = max(self.p - self.step, 0.0)
+
+    def __call__(self, imgs):
+        if self.p <= 0.0:
+            return imgs
+        B = imgs.size(0)
+        device = imgs.device
+        color_p = min(self.p, self.color_max_p)
+
+        flip = torch.rand(B, device=device) < self.p
+        if flip.any():
+            imgs = torch.where(flip.view(B, 1, 1, 1), imgs.flip(-1), imgs)
+
+        H, W = imgs.shape[2], imgs.shape[3]
+        max_ty, max_tx = int(H * 0.125), int(W * 0.125)
+        for b in range(B):
+            if random.random() < self.p:
+                ty = random.randint(-max_ty, max_ty)
+                tx = random.randint(-max_tx, max_tx)
+                if ty != 0 or tx != 0:
+                    imgs[b] = torch.roll(imgs[b], shifts=(ty, tx), dims=(1, 2))
+
+        bright = (torch.rand(B, device=device) < self.p).view(B, 1, 1, 1)
+        scale = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 0.4
+        imgs = torch.where(bright, imgs * scale, imgs)
+
+        luma_w = torch.tensor([0.299, 0.587, 0.114], device=device).view(1, 3, 1, 1)
+        sat = (torch.rand(B, device=device) < color_p).view(B, 1, 1, 1)
+        sat_scale = 1.0 + (torch.rand(B, 1, 1, 1, device=device) - 0.5) * 1.0
+        luma = (imgs * luma_w).sum(1, keepdim=True)
+        imgs = torch.where(sat, luma + sat_scale * (imgs - luma), imgs)
+
+        hue = torch.rand(B, device=device) < color_p
+        if hue.any():
+            theta = (torch.rand(B, device=device) * 2.0 - 1.0) * math.pi
+            theta = torch.where(hue, theta, torch.zeros_like(theta))
+            c = theta.cos().view(B, 1, 1)
+            s = theta.sin().view(B, 1, 1)
+            v = 1.0 / math.sqrt(3.0)
+            eye = torch.eye(3, device=device).unsqueeze(0)
+            vvt = torch.full((1, 3, 3), v * v, device=device)
+            K = torch.tensor([[0.0, -v, v], [v, 0.0, -v], [-v, v, 0.0]],
+                             device=device).unsqueeze(0)
+            R = c * eye + s * K + (1.0 - c) * vvt
+            imgs = torch.einsum('bij,bjhw->bihw', R, imgs)
+
+        noisy = (torch.rand(B, device=device) < self.p * 0.5).view(B, 1, 1, 1)
+        imgs = torch.where(noisy, imgs + 0.05 * torch.randn_like(imgs), imgs)
+
+        H, W = imgs.shape[2], imgs.shape[3]
+        ph, pw = H // 4, W // 4
+        cut = torch.ones_like(imgs)
+        for b in range(B):
+            if random.random() < self.p * 0.5:
+                t = random.randint(0, H - ph)
+                l = random.randint(0, W - pw)
+                cut[b, :, t:t + ph, l:l + pw] = 0.0
+        return imgs * cut
+
+
+class EMA:
+    """Exponential moving average of G's parameters, used for all inference."""
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {name: p.data.clone()
+                       for name, p in model.named_parameters() if p.requires_grad}
+        self.backup = {}
+
+    def update(self, model):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+    def apply_shadow(self, model):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.backup[name] = p.data.clone()
+                p.data.copy_(self.shadow[name])
+
+    def restore(self, model):
+        for name, p in model.named_parameters():
+            if name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+
+def save_metrics(history):
+    path = METRICS_DIR / 'training_metrics.json'
+    with open(path, 'w') as f:
+        json.dump(history, f, indent=2)
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    p = Path(checkpoint_dir) / 'checkpoint_latest.pth'
+    return p if p.exists() else None
+
+
+def autocast():
+    return torch.amp.autocast('cuda', enabled=cfg.use_cuda)
+
+
+def train(end_epoch, resume=False, checkpoint_path=None, reset_d=False):
+    img_transform = transforms.Compose([
+        transforms.Resize((cfg.img_height, cfg.img_width),
+                          interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(0.5 if cfg.xflip else 0.0),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5] * 3, [0.5] * 3),
+    ])
+
+    dataset = EyeglassesDataset(str(DATASET_PATH), img_transform)
+    sampler = None
+    if cfg.sample_weights:
+        with open(cfg.sample_weights) as f:
+            wmap = json.load(f)['weights']
+        weights = [wmap.get(os.path.basename(p), 1.0) for p in dataset.image_paths]
+        n_boosted = sum(1 for w in weights if w > 1.0)
+        total = sum(weights)
+        print(f'Weighted sampling: {n_boosted}/{len(weights)} boosted images, '
+              f'{100 * sum(w for w in weights if w > 1.0) / total:.1f}% of drawn samples '
+              f'({cfg.sample_weights})')
+        sampler = WeightedRandomSampler(weights, num_samples=len(dataset),
+                                        replacement=True)
+    loader = DataLoader(dataset, batch_size=cfg.batch_size,
+                        shuffle=sampler is None, sampler=sampler,
+                        num_workers=cfg.num_workers, drop_last=True,
+                        pin_memory=cfg.use_cuda)
+
+    G = Generator(cfg.latent_dim, cfg.w_dim, cfg.mapping_depth,
+                  cfg.g_width_mult,
+                  cfg.g_mirror_coupling,
+                  cfg.g_mirror_axis).to(cfg.device)
+    D = Discriminator(cfg.d_width_mult, cfg.d_edge_channel).to(cfg.device)
+
+    vgg = VGGPerceptualLoss().to(cfg.device) if cfg.perceptual_weight > 0 else None
+    ada = ADAugment(cfg.ada_target, cfg.ada_step, cfg.ada_max_p, cfg.ada_interval,
+                    color_max_p=cfg.ada_color_max_p)
+
+    g_optim = optim.Adam(G.parameters(), lr=cfg.lr_g, betas=(cfg.beta1, cfg.beta2))
+    d_optim = optim.Adam(D.parameters(), lr=cfg.lr_d, betas=(cfg.beta1, cfg.beta2))
+
+    scaler_g = torch.amp.GradScaler('cuda', enabled=cfg.use_cuda)
+    scaler_d = torch.amp.GradScaler('cuda', enabled=cfg.use_cuda)
+
+    ema = EMA(G, cfg.ema_decay)
+    fixed_z = torch.randn(16, cfg.latent_dim, device=cfg.device)
+
+    history = {
+        'epoch': [], 'g_loss': [], 'd_loss': [], 'perc_loss': [], 'fm_loss': [],
+        'g_total': [], 'd_real': [], 'd_fake': [], 'ada_p': [],
+        'kid': [], 'epoch_sec': [], 'total_hrs': [],
+    }
+
+    best_kid = float('inf')
+    ppl_mean_ema = 0.0
+    start_epoch = 0
+
+    if resume and checkpoint_path and os.path.exists(str(checkpoint_path)):
+        print(f'Loading checkpoint: {checkpoint_path}')
+        ckpt = torch.load(str(checkpoint_path), map_location=cfg.device)
+        if ckpt.get('inference_only'):
+            raise SystemExit(
+                f'{checkpoint_path} is a generator-only snapshot: it has no D '
+                'and no optimiser states, so training cannot resume from it. '
+                'Use it with --generate-only, or resume from '
+                'checkpoint_latest.pth.')
+        G.load_state_dict(ckpt['G'])
+        g_optim.load_state_dict(ckpt['g_optim'])
+        ema.shadow = ckpt.get('ema', ema.shadow)
+        history = ckpt.get('history', history)
+        ppl_mean_ema = ckpt.get('ppl_mean_ema', 0.0)
+        start_epoch = ckpt['epoch'] + 1
+        if reset_d:
+            print(f'Resuming G from epoch {start_epoch} with a FRESH '
+                  f'discriminator (--reset-d)')
+        else:
+            D.load_state_dict(ckpt['D'])
+            d_optim.load_state_dict(ckpt['d_optim'])
+            ada.p = ckpt.get('ada_p', 0.0)
+            best_kid = ckpt.get('best_kid', best_kid)
+            print(f'Resuming from epoch {start_epoch}')
+        for pg in g_optim.param_groups:
+            pg['lr'] = cfg.lr_g
+        for pg in d_optim.param_groups:
+            pg['lr'] = cfg.lr_d
+
+    g_params = sum(p.numel() for p in G.parameters() if p.requires_grad)
+    d_params = sum(p.numel() for p in D.parameters() if p.requires_grad)
+    print(f'Generator params:     {g_params:,}')
+    print(f'Discriminator params: {d_params:,}')
+    print(f'Training epochs {start_epoch} -> {end_epoch}\n')
+
+    kid_real_pool = None
+    kid_metric = None
+
+    t0 = time.time()
+    global_step = 0
+    d_collapse_counter = 0
+
+    for epoch in range(start_epoch, end_epoch):
+        t_epoch = time.time()
+        if cfg.d_edge_channel and cfg.d_edge_warmup > 0:
+            D.edge_scale = min(1.0, (epoch - start_epoch + 1) / cfg.d_edge_warmup)
+        G.train()
+        D.train()
+        sums = {'g': 0.0, 'd': 0.0, 'perc': 0.0, 'fm': 0.0,
+                'g_total': 0.0, 'dr': 0.0, 'df': 0.0}
+        g_steps_skipped = 0
+
+        pbar = tqdm(loader, desc=f'Epoch {epoch + 1}/{end_epoch}', leave=False)
+        for real_imgs in pbar:
+            real_imgs = real_imgs.to(cfg.device)
+            batch_size = real_imgs.size(0)
+
+            d_optim.zero_grad()
+
+            aug_imgs = ada(real_imgs.detach().clone())
+            with autocast():
+                real_pred, real_feats = D(aug_imgs, return_features=True)
+            ada.update(real_pred.detach().float())
+
+            with torch.no_grad():
+                z = torch.randn(batch_size, cfg.latent_dim, device=cfg.device)
+                with autocast():
+                    fake_imgs = G(z, cfg.style_mixing_prob)
+                fake_aug = ada(fake_imgs.float().clone())
+
+            with autocast():
+                fake_pred = D(fake_aug)
+                d_loss = d_logistic(real_pred.float(), fake_pred.float())
+
+            if global_step % cfg.r1_interval == 0:
+                real_imgs_r1 = real_imgs.detach().requires_grad_(True)
+                real_pred_r1 = D(real_imgs_r1)
+                r1 = r1_penalty(real_pred_r1, real_imgs_r1)
+                d_loss = d_loss + cfg.r1_gamma * 0.5 * cfg.r1_interval * r1
+
+            if d_loss.item() < 1e-4:
+                d_collapse_counter += 1
+                if d_collapse_counter > 100:
+                    print(f'\nD saturated (d_loss={d_loss.item():.2e} for 100 steps). Stopping.')
+                    return
+            else:
+                d_collapse_counter = 0
+
+            scaler_d.scale(d_loss).backward()
+            scaler_d.unscale_(d_optim)
+            torch.nn.utils.clip_grad_norm_(D.parameters(), 1.0)
+            scaler_d.step(d_optim)
+            scaler_d.update()
+
+            g_optim.zero_grad()
+
+            z = torch.randn(batch_size, cfg.latent_dim, device=cfg.device)
+            with autocast():
+                fake_imgs = G(z, cfg.style_mixing_prob)
+            fake_imgs = fake_imgs.float()
+            fake_aug = ada(fake_imgs.clone())
+
+            with autocast():
+                fake_pred, fake_feats = D(fake_aug, return_features=True)
+
+            g_adv = g_nonsat(fake_pred.float())
+
+            perc_loss = torch.tensor(0.0, device=cfg.device)
+            if vgg is not None:
+                perc_loss = vgg(fake_imgs, real_imgs)
+
+            fm_loss = torch.stack([
+                F.l1_loss(f.float().mean([2, 3]), r.detach().float().mean([2, 3]))
+                for f, r in zip(fake_feats, real_feats)
+            ]).mean()
+
+            g_total = (g_adv
+                       + cfg.perceptual_weight * perc_loss
+                       + cfg.fm_weight * fm_loss)
+
+            if cfg.ppl_weight > 0 and global_step % cfg.ppl_interval == 0:
+                z_ppl = torch.randn(cfg.ppl_batch_size, cfg.latent_dim, device=cfg.device)
+                w_ppl = G.get_w(z_ppl)
+                ppl_imgs = G.synthesis(w_ppl)
+                noise = torch.randn_like(ppl_imgs) / math.sqrt(
+                    ppl_imgs.shape[2] * ppl_imgs.shape[3])
+                grad = torch.autograd.grad(outputs=(ppl_imgs * noise).sum(),
+                                           inputs=w_ppl, create_graph=True)[0]
+                path_lengths = grad.pow(2).sum(1).sqrt()
+                path_mean = path_lengths.mean()
+                if ppl_mean_ema == 0.0:
+                    ppl_mean_ema = path_mean.item()
+                else:
+                    ppl_penalty = (path_lengths - ppl_mean_ema).pow(2).mean()
+                    with torch.no_grad():
+                        ppl_mean_ema = (ppl_mean_ema * cfg.ppl_decay
+                                        + path_mean.item() * (1 - cfg.ppl_decay))
+                    g_total = g_total + cfg.ppl_weight * ppl_penalty
+
+            scaler_g.scale(g_total).backward()
+            scaler_g.unscale_(g_optim)
+            torch.nn.utils.clip_grad_norm_(G.parameters(), 1.0)
+            scale_before = scaler_g.get_scale()
+            scaler_g.step(g_optim)
+            scaler_g.update()
+            if scaler_g.get_scale() < scale_before:
+                g_steps_skipped += 1
+            ema.update(G)
+
+            sums['g'] += g_adv.item()
+            sums['d'] += d_loss.item()
+            sums['perc'] += perc_loss.item()
+            sums['fm'] += fm_loss.item()
+            sums['g_total'] += g_total.item()
+            sums['dr'] += real_pred.mean().item()
+            sums['df'] += fake_pred.mean().item()
+            global_step += 1
+
+            pbar.set_postfix(G=f'{g_adv.item():.3f}', D=f'{d_loss.item():.3f}',
+                             ADA_p=f'{ada.p:.3f}')
+
+        n_batches = len(loader)
+        epoch_time = time.time() - t_epoch
+        total_hours = (time.time() - t0) / 3600
+
+        kid_mean = None
+        with torch.no_grad():
+            ema.apply_shadow(G)
+            G.eval()
+
+            eval_imgs = G(fixed_z)
+            save_image(eval_imgs.clamp(-1, 1),
+                       str(SAMPLES_DIR / f'epoch_{epoch + 1:04d}_imgs.png'),
+                       nrow=4, normalize=True, value_range=(-1, 1))
+
+            if (epoch + 1) >= cfg.kid_start and \
+                    (epoch + 1 - cfg.kid_start) % cfg.kid_interval == 0:
+                if kid_real_pool is None:
+                    print(f'Building real image pool for KID ({cfg.kid_n_real} images) ...')
+                    _pool = []
+                    for real_batch in loader:
+                        imgs_uint8 = ((real_batch.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
+                        _pool.append(imgs_uint8)
+                        if sum(x.size(0) for x in _pool) >= cfg.kid_n_real:
+                            break
+                    kid_real_pool = torch.cat(_pool)[:cfg.kid_n_real]
+                    kid_metric = KernelInceptionDistance(
+                        subset_size=min(100, cfg.kid_n_real // 2)).to(cfg.device)
+                kid_metric.reset()
+                for i in range(0, len(kid_real_pool), 64):
+                    kid_metric.update(kid_real_pool[i:i + 64].to(cfg.device), real=True)
+                n_fake_done = 0
+                while n_fake_done < cfg.kid_n_fake:
+                    bs_kid = min(32, cfg.kid_n_fake - n_fake_done)
+                    z_kid = torch.randn(bs_kid, cfg.latent_dim, device=cfg.device)
+                    with autocast():
+                        fake_kid = G(z_kid)
+                    fake_uint8 = ((fake_kid.float().clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
+                    kid_metric.update(fake_uint8, real=False)
+                    n_fake_done += bs_kid
+                kid_mean, kid_std = kid_metric.compute()
+                kid_mean = kid_mean.item()
+                print(f'  KID: {kid_mean:.5f} +- {kid_std.item():.5f}')
+
+            G.train()
+            ema.restore(G)
+
+        history['epoch'].append(epoch + 1)
+        history['g_loss'].append(sums['g'] / n_batches)
+        history['d_loss'].append(sums['d'] / n_batches)
+        history['perc_loss'].append(sums['perc'] / n_batches)
+        history['fm_loss'].append(sums['fm'] / n_batches)
+        history['g_total'].append(sums['g_total'] / n_batches)
+        history['d_real'].append(sums['dr'] / n_batches)
+        history['d_fake'].append(sums['df'] / n_batches)
+        history['ada_p'].append(ada.p)
+        history['kid'].append(kid_mean)
+        history['epoch_sec'].append(epoch_time)
+        history['total_hrs'].append(total_hours)
+
+        if g_steps_skipped:
+            pct = 100.0 * g_steps_skipped / n_batches
+            print(f'  WARNING: AMP skipped {g_steps_skipped}/{n_batches} '
+                  f'generator steps ({pct:.0f}%) this epoch'
+                  + ('  -- G DID NOT TRAIN' if g_steps_skipped == n_batches
+                     else ''))
+        history.setdefault('g_steps_skipped', []).append(g_steps_skipped)
+
+        kid_str = f'  KID={kid_mean:.5f}' if kid_mean is not None else ''
+        print(f'Ep {epoch + 1:4d}/{end_epoch}  '
+              f'G={sums["g"] / n_batches:.4f}  D={sums["d"] / n_batches:.4f}  '
+              f'FM={sums["fm"] / n_batches:.4f}  '
+              f'Dreal={sums["dr"] / n_batches:+.3f}  Dfake={sums["df"] / n_batches:+.3f}  '
+              f'ADA_p={ada.p:.3f}{kid_str}  '
+              f'{epoch_time:.0f}s  ({total_hours:.1f}h total)')
+
+        save_metrics(history)
+
+        ema.apply_shadow(G)
+        ckpt_data = {
+            'epoch': epoch,
+            'G': G.state_dict(),
+            'D': D.state_dict(),
+            'g_optim': g_optim.state_dict(),
+            'd_optim': d_optim.state_dict(),
+            'ema': ema.shadow,
+            'ada_p': ada.p,
+            'best_kid': best_kid,
+            'ppl_mean_ema': ppl_mean_ema,
+            'history': history,
+        }
+        torch.save(ckpt_data, str(CHECKPOINT_DIR / 'checkpoint_latest.pth'))
+        if kid_mean is not None and kid_mean < best_kid:
+            best_kid = kid_mean
+            ckpt_data['best_kid'] = best_kid
+            torch.save(ckpt_data, str(CHECKPOINT_DIR / 'checkpoint_best.pth'))
+            print(f'  Best checkpoint saved (KID {kid_mean:.5f})')
+        if cfg.snapshot_every and (epoch + 1) % cfg.snapshot_every == 0:
+            snap = CHECKPOINT_DIR / f'snapshot_ep{epoch + 1:05d}.pth'
+            torch.save({'epoch': epoch, 'G': G.state_dict(),
+                        'kid': kid_mean, 'inference_only': True}, str(snap))
+            print(f'  Snapshot saved ({snap.name})')
+        ema.restore(G)
+
+    print(f'\nfinished, {(time.time() - t0) / 3600:.2f}h total')
+    save_metrics(history)
+
+
+def generate(checkpoint_path, num_images=10000, truncation_psi=0.7, batch_size=32,
+             pure_frac=0.30, truncation_psi_fine=None, truncation_cutoff=3,
+             truncation_centers=1):
+    """Generate a dataset from a trained checkpoint (images only)."""
+    if truncation_psi_fine is None:
+        truncation_psi_fine = truncation_psi
+    img_dir = GENERATED_DIR / 'images'
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt = torch.load(str(checkpoint_path), map_location=cfg.device)
+    G = Generator(cfg.latent_dim, cfg.w_dim, cfg.mapping_depth,
+                  cfg.g_width_mult,
+                  cfg.g_mirror_coupling,
+                  cfg.g_mirror_axis).to(cfg.device)
+    G.load_state_dict(ckpt['G'])
+    if 'ema' in ckpt:
+        missing = [n for n, _ in G.named_parameters() if n not in ckpt['ema']]
+        if missing:
+            raise SystemExit(
+                f'{checkpoint_path} has an EMA state covering only '
+                f'{len(list(G.named_parameters())) - len(missing)} of '
+                f'{len(list(G.named_parameters()))} generator parameters. '
+                f'First missing: {missing[:3]}. Refusing to generate from a '
+                'half-EMA, half-raw generator.')
+        for name, param in G.named_parameters():
+            param.data.copy_(ckpt['ema'][name])
+    G.eval()
+
+    print('Computing w_mean ...')
+    w_samples = []
+    with torch.no_grad():
+        for _ in range(200):
+            z = torch.randn(50, cfg.latent_dim, device=cfg.device)
+            w_samples.append(G.get_w(z))
+    w_all = torch.cat(w_samples)
+    w_mean = w_all.mean(0, keepdim=True)
+
+    if truncation_centers > 1:
+        from sklearn.cluster import KMeans
+        print(f'Clustering w-space into {truncation_centers} truncation centers ...')
+        km = KMeans(n_clusters=truncation_centers, random_state=cfg.seed, n_init=10)
+        km.fit(w_all.cpu().numpy())
+        centers = torch.tensor(km.cluster_centers_, dtype=w_mean.dtype,
+                               device=cfg.device)
+    else:
+        centers = w_mean
+
+    num_stages = G.num_stages
+    psi_per_stage = torch.tensor(
+        [truncation_psi] * truncation_cutoff +
+        [truncation_psi_fine] * (num_stages - truncation_cutoff),
+        device=cfg.device).view(1, num_stages, 1)
+
+    n_pure = int(num_images * pure_frac)
+    n_remaining = num_images - n_pure
+    n_interp2 = int(n_remaining * 4 / 7)
+    n_interp3 = int(n_remaining * 2 / 7)
+    n_interp4 = num_images - n_pure - n_interp2 - n_interp3
+    plan = ([('pure', 1)] * n_pure + [('interp2', 2)] * n_interp2 +
+            [('interp3', 3)] * n_interp3 + [('interp4', 4)] * n_interp4)
+    random.shuffle(plan)
+
+    generated = 0
+    with open(GENERATED_DIR / 'metadata.csv', 'w') as meta_file:
+        meta_file.write('id,type,n_z,psi,psi_fine,cutoff,centers,center_id\n')
+        pbar = tqdm(total=num_images, desc='Generating')
+        with torch.no_grad():
+            while generated < num_images:
+                bs = min(batch_size, num_images - generated)
+                batch_plan = plan[generated:generated + bs]
+                w_batch = torch.zeros(bs, G.w_dim, device=cfg.device)
+                rows = []
+
+                for j, (gen_type, n_z) in enumerate(batch_plan):
+                    idx = generated + j
+                    z_j = torch.randn(n_z, cfg.latent_dim, device=cfg.device)
+                    w_j = G.get_w(z_j)
+                    if n_z == 1:
+                        w_blend = w_j[0]
+                    elif n_z == 2:
+                        alpha = float(np.random.beta(0.4, 0.4))
+                        w_blend = alpha * w_j[0] + (1 - alpha) * w_j[1]
+                    else:
+                        conc = 0.7 if n_z == 3 else 0.5
+                        weights = np.random.dirichlet([conc] * n_z)
+                        w_blend = sum(float(weights[k]) * w_j[k] for k in range(n_z))
+                    w_batch[j] = w_blend
+
+                if truncation_centers > 1:
+                    dists = torch.cdist(w_batch, centers)
+                    assign = dists.argmin(dim=1)
+                    center_batch = centers[assign]
+                else:
+                    assign = torch.zeros(bs, dtype=torch.long, device=cfg.device)
+                    center_batch = centers.expand(bs, -1)
+
+                for j, (gen_type, n_z) in enumerate(batch_plan):
+                    idx = generated + j
+                    rows.append(f'{idx:05d},{gen_type},{n_z},{truncation_psi:.2f},'
+                                f'{truncation_psi_fine:.2f},{truncation_cutoff},'
+                                f'{truncation_centers},{int(assign[j])}\n')
+
+                w_expanded = w_batch.unsqueeze(1).expand(-1, num_stages, -1)
+                center_expanded = center_batch.unsqueeze(1).expand(-1, num_stages, -1)
+                w_expanded = center_expanded + psi_per_stage * (w_expanded - center_expanded)
+                imgs = G.synthesis(w_expanded)
+
+                for j in range(bs):
+                    save_image(imgs[j].clamp(-1, 1),
+                               str(img_dir / f'glass_{generated + j:05d}.png'),
+                               normalize=True, value_range=(-1, 1))
+                    meta_file.write(rows[j])
+
+                generated += bs
+                pbar.update(bs)
+        pbar.close()
+
+    print(f'Generated {generated} images -> {GENERATED_DIR}')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='StyleGAN2 for eyeglass frame generation (image-only).',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--images', default='data/source/images',
+                        help='Directory of training frame images')
+    parser.add_argument('--output', default='results/run',
+                        help='Output directory for this run')
+    parser.add_argument('--end-epoch', type=int, default=400)
+    parser.add_argument('--no-resume', action='store_true',
+                        help='Start from scratch, ignoring existing checkpoints')
+    parser.add_argument('--checkpoint', default=None,
+                        help='Explicit checkpoint path to resume from')
+    parser.add_argument('--generate', action='store_true',
+                        help='Generate images after training completes')
+    parser.add_argument('--generate-only', default=None, metavar='CHECKPOINT',
+                        help='Skip training; generate from the given checkpoint')
+    parser.add_argument('--num-images', type=int, default=10000,
+                        help='Number of images to generate')
+    parser.add_argument('--pure-frac', type=float, default=1.0,
+                        help='Fraction of images generated from a single latent; '
+                             'the rest blend 2, 3 or 4 style codes in a 4:2:1 '
+                             'ratio. Use 1.0 for single-latent generation only')
+    parser.add_argument('--truncation-psi', type=float, default=1.0,
+                        help='Truncation psi for the coarse stages (see '
+                             '--truncation-cutoff), or for all stages if '
+                             '--truncation-psi-fine is not set')
+    parser.add_argument('--truncation-psi-fine', type=float, default=1.2,
+                        help='Truncation psi for the fine synthesis stages '
+                             '(colour, texture, detail)')
+    parser.add_argument('--truncation-cutoff', type=int, default=3,
+                        help='Index of the first fine stage. Stages 0..cutoff-1 '
+                             'use --truncation-psi, the rest use '
+                             '--truncation-psi-fine (6 stages, 8x16 to 256x512)')
+    parser.add_argument('--truncation-centers', type=int, default=1,
+                        help='Number of k-means centres in w space to truncate '
+                             'toward. 1 = truncation toward the global mean; '
+                             'k > 1 truncates each sample toward its nearest '
+                             'centre')
+    parser.add_argument('--batch-size', type=int, default=Config.batch_size)
+    parser.add_argument('--lr-g', type=float, default=Config.lr_g)
+    parser.add_argument('--lr-d', type=float, default=Config.lr_d)
+    parser.add_argument('--r1-gamma', type=float, default=Config.r1_gamma)
+    parser.add_argument('--fm-weight', type=float, default=Config.fm_weight)
+    parser.add_argument('--ppl-weight', type=float, default=Config.ppl_weight)
+    parser.add_argument('--perceptual-weight', type=float, default=Config.perceptual_weight)
+    parser.add_argument('--style-mixing-prob', type=float, default=Config.style_mixing_prob)
+    parser.add_argument('--mapping-depth', type=int, default=Config.mapping_depth)
+    parser.add_argument('--d-width-mult', type=float, default=1.0,
+                        help='Discriminator channel width multiplier')
+    parser.add_argument('--d-edge-channel', action='store_true',
+                        default=Config.d_edge_channel,
+                        help='Add a Sobel edge-magnitude channel to the '
+                             'discriminator input. Not compatible with '
+                             'checkpoints trained without it')
+    parser.add_argument('--ppl-batch-size', type=int,
+                        default=Config.ppl_batch_size,
+                        help='Batch size for the path length regularizer. '
+                             'Lower this first if training runs out of memory')
+    parser.add_argument('--g-width-mult', type=float,
+                        default=Config.g_width_mult,
+                        help='Generator channel width multiplier (capped at '
+                             '512 channels)')
+    parser.add_argument('--g-mirror-coupling', action='store_true',
+                        help='Mirror coupling in the generator at the 32x64 '
+                             'and 64x128 stages: each position also sees the '
+                             'horizontally flipped feature map. Changes the '
+                             'architecture, so checkpoints trained without it '
+                             'cannot be loaded')
+    parser.add_argument('--g-mirror-axis', action='store_true',
+                        help='Mirror coupling with a per-sample mirror axis '
+                             'predicted from w instead of the fixed centre. '
+                             'Implies --g-mirror-coupling. Separate '
+                             'architecture, not compatible with checkpoints '
+                             'trained without it')
+    parser.add_argument('--reset-d', action='store_true',
+                        help='On resume, load only the generator and start '
+                             'a new discriminator')
+    parser.add_argument('--d-edge-warmup', type=int,
+                        default=Config.d_edge_warmup,
+                        help='Epochs over which the edge channel is faded in '
+                             '(0 = full strength from the start)')
+    parser.add_argument('--ada-target', type=float, default=Config.ada_target)
+    parser.add_argument('--ada-max-p', type=float, default=Config.ada_max_p,
+                        help='Upper limit for the ADA augmentation probability')
+    parser.add_argument('--ada-color-max-p', type=float, default=Config.ada_color_max_p,
+                        help='Upper limit for the hue/saturation augmentation '
+                             'probability; 0 disables colour augmentation')
+    parser.add_argument('--kid-start', type=int, default=Config.kid_start)
+    parser.add_argument('--snapshot-every', type=int, default=Config.snapshot_every,
+                        help='Save a generator-only snapshot every N epochs '
+                             '(0 = off). Snapshots can be used with '
+                             '--generate-only but not for resuming training')
+    parser.add_argument('--sample-weights', default=Config.sample_weights,
+                        help='Sample weights file from '
+                             'metrics/compute_sample_weights.py (empty = uniform '
+                             'sampling)')
+    parser.add_argument('--no-xflip', action='store_true',
+                        help='Disable dataset-level horizontal flips')
+    parser.add_argument('--num-workers', type=int, default=Config.num_workers)
+    parser.add_argument('--seed', type=int, default=Config.seed)
+    args = parser.parse_args()
+
+    cfg.batch_size = args.batch_size
+    cfg.lr_g = args.lr_g
+    cfg.lr_d = args.lr_d
+    cfg.r1_gamma = args.r1_gamma
+    cfg.fm_weight = args.fm_weight
+    cfg.ppl_weight = args.ppl_weight
+    cfg.perceptual_weight = args.perceptual_weight
+    cfg.style_mixing_prob = args.style_mixing_prob
+    cfg.mapping_depth = args.mapping_depth
+    cfg.d_width_mult = args.d_width_mult
+    cfg.g_width_mult = args.g_width_mult
+    cfg.g_mirror_coupling = args.g_mirror_coupling
+    cfg.g_mirror_axis = args.g_mirror_axis
+    cfg.ppl_batch_size = args.ppl_batch_size
+    cfg.d_edge_channel = args.d_edge_channel
+    cfg.d_edge_warmup = args.d_edge_warmup
+    cfg.ada_target = args.ada_target
+    cfg.ada_max_p = args.ada_max_p
+    cfg.ada_color_max_p = args.ada_color_max_p
+    cfg.sample_weights = args.sample_weights
+    cfg.xflip = not args.no_xflip
+    cfg.kid_start = args.kid_start
+    cfg.snapshot_every = args.snapshot_every
+    cfg.num_workers = args.num_workers
+    cfg.seed = args.seed
+
+    DATASET_PATH = Path(args.images)
+    OUTPUT_ROOT = Path(args.output)
+    CHECKPOINT_DIR = OUTPUT_ROOT / 'checkpoints'
+    SAMPLES_DIR = OUTPUT_ROOT / 'samples'
+    METRICS_DIR = OUTPUT_ROOT / 'metrics'
+    GENERATED_DIR = OUTPUT_ROOT / 'generated'
+
+    setup_directories()
+    save_run_config(args)
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+
+    print(f'PyTorch {torch.__version__}')
+    print(f'CUDA available: {torch.cuda.is_available()}')
+    if torch.cuda.is_available():
+        print(f'GPU: {torch.cuda.get_device_name(0)} '
+              f'({torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB)')
+    print(f'Data: {DATASET_PATH}')
+    print(f'Output: {OUTPUT_ROOT}')
+
+    if args.generate_only:
+        generate(args.generate_only, num_images=args.num_images,
+                 truncation_psi=args.truncation_psi, pure_frac=args.pure_frac,
+                 truncation_psi_fine=args.truncation_psi_fine,
+                 truncation_cutoff=args.truncation_cutoff,
+                 truncation_centers=args.truncation_centers)
+    else:
+        resume = not args.no_resume
+        checkpoint_path = args.checkpoint
+        if checkpoint_path is None and resume:
+            checkpoint_path = find_latest_checkpoint(CHECKPOINT_DIR)
+        print(f'Checkpoint: {checkpoint_path}' if checkpoint_path else 'Starting from scratch.')
+
+        train(end_epoch=args.end_epoch, resume=resume,
+              checkpoint_path=checkpoint_path if resume else None,
+              reset_d=args.reset_d)
+
+        if args.generate:
+            best_ckpt = CHECKPOINT_DIR / 'checkpoint_best.pth'
+            final_ckpt = str(best_ckpt) if best_ckpt.exists() \
+                else find_latest_checkpoint(CHECKPOINT_DIR)
+            if final_ckpt:
+                generate(final_ckpt, num_images=args.num_images,
+                         truncation_psi=args.truncation_psi, pure_frac=args.pure_frac,
+                         truncation_psi_fine=args.truncation_psi_fine,
+                         truncation_cutoff=args.truncation_cutoff,
+                         truncation_centers=args.truncation_centers)

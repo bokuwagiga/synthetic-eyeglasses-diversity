@@ -1,0 +1,37 @@
+{
+  "model": "sharp1",
+  "training": {
+    "batch_size": 16,
+    "lr_g": 0.0002,
+    "lr_d": 5e-05,
+    "r1_gamma": 5.0,
+    "fm_weight": 2.0,
+    "ppl_weight": 4.0,
+    "ppl_batch_size": 16,
+    "perceptual_weight": 0.75,
+    "style_mixing_prob": 0.9,
+    "mapping_depth": 8,
+    "g_width_mult": 1.0,
+    "d_width_mult": 1.0,
+    "g_mirror_coupling": false,
+    "g_mirror_axis": false,
+    "ada_target": 0.6,
+    "ada_max_p": 0.95,
+    "ada_color_max_p": 0.0,
+    "kid_start": 100,
+    "no_xflip": false,
+    "seed": 42,
+    "end_epoch": 1600,
+    "sample_weights": "data/sample_weights.json"
+  },
+  "generation": {
+    "num_images": 10000,
+    "pure_frac": 1.0,
+    "truncation_psi": 1.0,
+    "truncation_psi_fine": 1.2,
+    "truncation_cutoff": 3,
+    "truncation_centers": 1,
+    "seed": 42
+  },
+  "selected_checkpoint": "lowest training KID (checkpoint_best.pth)"
+}
