@@ -140,7 +140,7 @@ in the paper are of the order of 0.05 FID and 0.02 recall.
 
 ## Pretrained models and generated datasets
 
-Zenodo: DOI will be added here.
+Zenodo: https://doi.org/10.5281/zenodo.23287084
 
 - `mirror2_generator.pth`, `sharp1_generator.pth` - generator weights (EMA)
 - `mirror2_images.zip`, `sharp1_images.zip` - 10,000 generated images each,
