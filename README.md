@@ -119,6 +119,46 @@ python metrics/diagnose_ab_gap.py --real data/source/images \
     --generated results/mirror2_eval/generated/images --out results/mirror2_eval/ab_gap
 ```
 
+## StyleGAN2-ADA baseline
+
+The paper compares our models with the official StyleGAN2-ADA, trained with
+NVIDIA's StyleGAN3 code (https://github.com/NVlabs/stylegan3, commit
+c233a919) in its StyleGAN2 configuration. The official code trains on square
+images only, so the 256x512 images are padded to 512x512 and the generated
+images are cropped back:
+
+```
+python baseline/prepare_data.py --images data/source/images --out ../sg2ada_data/padded
+python <stylegan3>/dataset_tool.py --source ../sg2ada_data/padded \
+    --dest ../sg2ada_data/catalogue_512.zip --resolution 512x512
+
+cd <stylegan3>
+python train.py --outdir=../sg2ada_runs --data=../sg2ada_data/catalogue_512.zip \
+    --cfg=stylegan2 --gpus=1 --batch=16 --mirror=1 --aug=ada --gamma=10 \
+    --metrics=fid50k_full --kimg=3000 --snap=50
+```
+
+The paper reports two runs that differ only in `--gamma`: 3.2768 (the
+heuristic 0.0002 * 512^2 / 16 of the ADA paper) and 10. The snapshot with the
+lowest `fid50k_full` is selected, as in the official procedure. The gamma-10
+run was stopped by a rule fixed in advance: stop when the lowest FID has not
+improved by more than 2% over three consecutive snapshots, or when the FID
+exceeds three times the lowest value. Then:
+
+```
+python gen_images.py --network=<snapshot.pkl> --seeds=0-9999 --trunc=1 \
+    --noise-mode=const --outdir=../sg2ada_gen/baseline_512
+cd <this repository>
+python baseline/crop_generated.py --src ../sg2ada_gen/baseline_512 \
+    --dst results/baseline/generated/images
+```
+
+and evaluate `results/baseline/generated/images` with the commands of the
+Evaluation section. Running the official code with current PyTorch and SciPy
+versions needs a few compatibility changes (sampler constructor, custom-op
+module loading, `scipy.linalg.sqrtm` call); none of them changes the training
+or the FID computation.
+
 ## Reproducing the paper tables and figures
 
 | Paper item | Command |
@@ -131,7 +171,8 @@ python metrics/diagnose_ab_gap.py --real data/source/images \
 | Colour coverage bin check | `python metrics/ab_bin_stability.py --real ... --sets name=path ...` |
 | Artifact rates | `diagnose_artifacts.py` |
 | Novelty table | `novelty_rate.py`; calibration with `--calibration-check` |
-| Pareto figure | `python scripts/make_pareto_figure.py --runs label=path ...` |
+| Baseline comparison table | the StyleGAN2-ADA section above, then `evaluate_diversity.py`, `diagnose_artifacts.py` and `novelty_rate.py` on the cropped images |
+| Pareto figure | `python scripts/make_pareto_figure.py --runs label=path ... --baseline-runs label=path` |
 | Sample grid | `python scripts/make_report_grid.py --real ... --generated label=path ...` |
 
 Results depend on the GPU, driver and library versions, so values may differ
